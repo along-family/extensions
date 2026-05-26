@@ -2,8 +2,9 @@
   "manifest_version": 3,
   "name": "Lazy Page Preloader",
   "version": "1.0.0",
-  "description": "Preload paginated pages in background tabs for lazy-loading websites.",
+  "description": "Preload paginated pages for lazy-loading websites.",
   "permissions": [
+    "alarms",
     "notifications",
     "scripting",
     "storage",

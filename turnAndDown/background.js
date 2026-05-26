@@ -1,7 +1,7 @@
 import {
   DEBUG_LOGS_STORAGE_KEY,
   LAST_INPUT_STORAGE_KEY,
-  PAGE_LOAD_TIMEOUT_MS,
+  PAGE_READY_TIMEOUT_MS,
   STATUS_STORAGE_KEY,
   buildPageUrls,
   createIdleStatus,
@@ -15,12 +15,15 @@ let debugLogs = [];
 
 const MAX_DEBUG_LOGS = 400;
 const PANEL_PORT_NAME = "lazy-page-preloader-panel";
+const ACTIVE_TASK_STORAGE_KEY = "activePreloadTask";
+const TASK_ALARM_NAME = "lazy-page-preloader-active-task";
 const PANEL_FILES = {
   css: ["panel.css"],
   js: ["panel.js"]
 };
 
 const connectedPanelPorts = new Set();
+let taskRunnerPromise = null;
 
 chrome.runtime.onInstalled.addListener(() => {
   void persistStatus(currentStatus);
@@ -29,6 +32,12 @@ chrome.runtime.onInstalled.addListener(() => {
 
 chrome.runtime.onStartup.addListener(() => {
   void restorePersistedState();
+});
+
+chrome.alarms.onAlarm.addListener((alarm) => {
+  if (alarm.name === TASK_ALARM_NAME) {
+    void restorePersistedState();
+  }
 });
 
 chrome.action.onClicked.addListener((tab) => {
@@ -46,6 +55,7 @@ chrome.runtime.onConnect.addListener((port) => {
     if (message?.type === "PING") {
       try {
         port.postMessage({ type: "PONG", at: Date.now() });
+        port.postMessage({ type: "STATUS_UPDATE", status: currentStatus });
       } catch (error) {
         appendDebugLog("panel-port-pong-failed", {
           error: toLoggableError(error)
@@ -88,7 +98,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       .catch((error) => {
         sendResponse({
           ok: false,
-          message: error?.message || "Failed to load panel bootstrap data."
+          message: error?.message || "加载面板数据失败。"
         });
       });
     return true;
@@ -118,8 +128,8 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       const response = beginPreloadTask(message.payload);
       sendResponse(response);
     } catch (error) {
-      console.error("Failed to start preload task:", error);
-      sendResponse({ ok: false, message: "Failed to start the preload task." });
+      console.error("启动预加载任务失败:", error);
+      sendResponse({ ok: false, message: "启动预加载任务失败。" });
     }
     return false;
   }
@@ -131,7 +141,7 @@ void restorePersistedState();
 
 function beginPreloadTask(payload) {
   if (currentTask?.phase === "running") {
-    return { ok: false, message: "Another preload task is already running." };
+    return { ok: false, message: "已有预加载任务正在运行。" };
   }
 
   debugLogs = [];
@@ -142,24 +152,32 @@ function beginPreloadTask(payload) {
     return { ok: false, message: validation.message };
   }
 
-  const { url, count, waitSeconds } = validation.value;
+  const { url, count, waitSeconds, concurrentTabs } = validation.value;
   const targets = buildPageUrls(url, count);
   if (!targets.length) {
-    return { ok: false, message: "No target pages were generated from the URL." };
+    return { ok: false, message: "没有从 URL 生成可处理的目标页面。" };
   }
 
   void chrome.storage.local.set({
     [LAST_INPUT_STORAGE_KEY]: {
       url,
       count,
-      waitSeconds
+      waitSeconds,
+      concurrentTabs
     }
   });
 
   const taskId = ++taskSequence;
+  const startedAt = new Date().toISOString();
   currentTask = {
     id: taskId,
-    phase: "running"
+    phase: "running",
+    targets,
+    waitSeconds,
+    concurrentTabs,
+    nextIndex: 0,
+    activeTabId: null,
+    startedAt
   };
 
   appendDebugLog("task-start", {
@@ -167,6 +185,7 @@ function beginPreloadTask(payload) {
     url,
     count,
     waitSeconds,
+    concurrentTabs,
     targets,
     panelConnections: connectedPanelPorts.size
   });
@@ -177,12 +196,41 @@ function beginPreloadTask(payload) {
     currentIndex: 0,
     successCount: 0,
     failureCount: 0,
-    message: "Task started. The panel can stay open while the worker runs.",
-    startedAt: new Date().toISOString()
+    message: "任务已启动，请保持面板打开以查看实时进度。",
+    startedAt
   });
 
-  Promise.resolve().then(() =>
-    runPreloadTask(taskId, targets, waitSeconds).catch((error) => {
+  void persistActiveTask();
+  ensureTaskAlarm();
+  startTaskRunner(taskId);
+
+  return {
+    ok: true,
+    status: currentStatus
+  };
+}
+
+function startTaskRunner(taskId) {
+  if (taskRunnerPromise || !isCurrentTask(taskId)) {
+    return;
+  }
+
+  taskRunnerPromise = Promise.resolve()
+    .then(async () => {
+      const task = currentTask;
+      if (!task || task.id !== taskId) {
+        return;
+      }
+
+      await runPreloadTask(
+        task.id,
+        task.targets,
+        task.waitSeconds,
+        task.concurrentTabs || 1,
+        task.nextIndex || 0
+      );
+    })
+    .catch((error) => {
       console.error("Unexpected preload task error:", error);
       appendDebugLog("task-crash", {
         taskId,
@@ -195,68 +243,67 @@ function beginPreloadTask(payload) {
 
       finishTask({
         phase: "failed-partial",
-        message: "The task crashed unexpectedly. Check the debug log."
+        message: "任务异常中断，请查看诊断日志。"
       });
     })
-  );
-
-  return {
-    ok: true,
-    status: currentStatus
-  };
+    .finally(() => {
+      taskRunnerPromise = null;
+    });
 }
 
-async function runPreloadTask(taskId, targets, waitSeconds) {
-  for (let index = 0; index < targets.length; index += 1) {
+async function runPreloadTask(
+  taskId,
+  targets,
+  waitSeconds,
+  concurrentTabs = 1,
+  startIndex = 0
+) {
+  const batchSize = Math.min(Math.max(concurrentTabs || 1, 1), targets.length);
+
+  for (let batchStart = startIndex; batchStart < targets.length; batchStart += batchSize) {
     if (!isCurrentTask(taskId)) {
       return;
     }
 
-    const target = targets[index];
+    const batchTargets = targets
+      .slice(batchStart, batchStart + batchSize)
+      .map((target, offset) => ({
+        target,
+        index: batchStart + offset
+      }));
+
+    currentTask.nextIndex = batchStart;
+    await persistActiveTask();
+
     setStatus({
-      currentIndex: index + 1,
-      message: `Processing page ${target.page} (${index + 1}/${targets.length})`
+      currentIndex: batchStart + 1,
+      message:
+        batchTargets.length > 1
+          ? `正在同时处理第 ${batchStart + 1}-${batchStart + batchTargets.length}/${targets.length} 个后台标签页。`
+          : `正在处理第 ${batchStart + 1}/${targets.length} 个后台标签页。`
     });
 
-    try {
-      appendDebugLog("target-start", {
-        taskId,
+    appendDebugLog("batch-start", {
+      taskId,
+      batchStart,
+      batchSize: batchTargets.length,
+      concurrentTabs: batchSize,
+      targets: batchTargets.map(({ target, index }) => ({
         index,
         page: target.page,
         url: target.url
-      });
+      }))
+    });
 
-      await processTarget(target, waitSeconds);
+    await Promise.all(
+      batchTargets.map(({ target, index }) =>
+        runTarget(taskId, target, waitSeconds, index, targets.length, batchTargets.length)
+      )
+    );
 
-      appendDebugLog("target-success", {
-        taskId,
-        index,
-        page: target.page,
-        url: target.url
-      });
-
-      incrementStatus("successCount");
-      setStatus({
-        message: `Finished page ${target.page} (${index + 1}/${targets.length})`
-      });
-    } catch (error) {
-      console.error(
-        `[LazyPagePreloader] Failed: page=${target.page} url=${target.url}`,
-        error
-      );
-
-      appendDebugLog("target-failure", {
-        taskId,
-        index,
-        page: target.page,
-        url: target.url,
-        error: toLoggableError(error)
-      });
-
-      incrementStatus("failureCount");
-      setStatus({
-        message: `Page ${target.page} failed. Continuing with the next page.`
-      });
+    if (isCurrentTask(taskId)) {
+      currentTask.nextIndex = batchStart + batchTargets.length;
+      await persistActiveTask();
     }
   }
 
@@ -275,61 +322,160 @@ async function runPreloadTask(taskId, targets, waitSeconds) {
   finishTask({
     phase: hasFailure ? "failed-partial" : "completed",
     message: hasFailure
-      ? `Finished with partial failures. Success: ${currentStatus.successCount}, failed: ${currentStatus.failureCount}.`
-      : `Finished successfully. Loaded ${currentStatus.successCount} pages.`
+      ? `任务完成，但存在失败页面。成功：${currentStatus.successCount}，失败：${currentStatus.failureCount}。`
+      : `任务完成，已处理 ${currentStatus.successCount} 个页面。`
   });
 }
 
-async function processTarget(target, waitSeconds) {
-  const createdTab = await chrome.tabs.create({
-    url: target.url,
-    active: false
-  });
-
-  const tabId = createdTab.id;
-  appendDebugLog("tab-created", {
-    tabId: tabId ?? null,
-    url: target.url,
-    active: createdTab.active,
-    status: createdTab.status
-  });
-
-  if (!tabId) {
-    throw new Error("Failed to create a background tab.");
+async function runTarget(taskId, target, waitSeconds, index, total, batchSize) {
+  if (!isCurrentTask(taskId)) {
+    return;
   }
 
-  await chrome.tabs.update(tabId, { autoDiscardable: false }).catch(() => {});
-  await waitForTabComplete(tabId, PAGE_LOAD_TIMEOUT_MS);
+  try {
+    appendDebugLog("target-start", {
+      taskId,
+      index,
+      page: target.page,
+      url: target.url,
+      tabId: target.tabId || null,
+      batchSize
+    });
 
-  const probeResult = await installDebugProbe(tabId);
-  appendDebugLog("probe-installed", {
-    tabId,
-    url: target.url,
-    probeResult
-  });
+    await processTarget(target, waitSeconds, index, total, batchSize);
 
-  const beforeScrollSnapshot = await collectDebugSnapshot(tabId, "before-scroll");
-  appendDebugLog("snapshot-before-scroll", {
-    tabId,
-    url: target.url,
-    snapshot: beforeScrollSnapshot
-  });
+    appendDebugLog("target-success", {
+      taskId,
+      index,
+      page: target.page,
+      url: target.url,
+      tabId: target.tabId || null,
+      batchSize
+    });
 
-  const scrollResult = await scrollTabToBottom(tabId, waitSeconds);
-  appendDebugLog("scroll-result", {
-    tabId,
-    url: target.url,
-    scrollResult
-  });
+    incrementStatus("successCount");
+    setStatus({
+      currentIndex: currentStatus.successCount + currentStatus.failureCount,
+      message: `已完成第 ${index + 1}/${total} 个页面：page=${target.page}`
+    });
+  } catch (error) {
+    console.error(
+      `[LazyPagePreloader] 处理失败: page=${target.page} url=${target.url}`,
+      error
+    );
 
-  const afterScrollSnapshot = await collectDebugSnapshot(tabId, "after-scroll");
-  appendDebugLog("snapshot-after-scroll", {
-    tabId,
-    url: target.url,
-    snapshot: afterScrollSnapshot
-  });
+    appendDebugLog("target-failure", {
+      taskId,
+      index,
+      page: target.page,
+      url: target.url,
+      tabId: target.tabId || null,
+      batchSize,
+      error: toLoggableError(error)
+    });
 
-  analyzeTargetOutcome(target, beforeScrollSnapshot, scrollResult, afterScrollSnapshot);
+    incrementStatus("failureCount");
+    setStatus({
+      currentIndex: currentStatus.successCount + currentStatus.failureCount,
+      message: `page=${target.page} 处理失败，继续下一个页面。`
+    });
+  }
+}
+
+async function processTarget(target, waitSeconds, index, total, batchSize) {
+  let tabId = target.tabId || null;
+  const startedAt = Date.now();
+
+  try {
+    if (!tabId) {
+      const createdTab = await chrome.tabs.create({
+        url: target.url,
+        active: false
+      });
+
+      tabId = createdTab.id || null;
+      if (!tabId) {
+        throw new Error(`创建后台标签页失败：page=${target.page}`);
+      }
+
+      target.tabId = tabId;
+      await chrome.tabs.update(tabId, { autoDiscardable: false }).catch(() => {});
+
+      appendDebugLog("tab-created", {
+        tabId,
+        url: target.url,
+        page: target.page,
+        active: createdTab.active,
+        status: createdTab.status
+      });
+
+      await persistActiveTask();
+    }
+
+    if (currentTask) {
+      currentTask.activeTabId = tabId;
+      await persistActiveTask();
+    }
+
+    setStatus({
+      message:
+        batchSize > 1
+          ? `同时打开 ${batchSize} 个后台标签页；正在处理第 ${index + 1}/${total} 个：page=${target.page}`
+          : `正在处理第 ${index + 1}/${total} 个后台标签页：page=${target.page}`
+    });
+    const readyResult = await waitForTabReady(tabId, PAGE_READY_TIMEOUT_MS);
+    appendDebugLog("tab-ready", {
+      tabId,
+      url: target.url,
+      ...readyResult
+    });
+
+    const probeResult = await installDebugProbe(tabId);
+    appendDebugLog("probe-installed", {
+      tabId,
+      url: target.url,
+      probeResult
+    });
+
+    const beforeScrollSnapshot = await collectDebugSnapshot(tabId, "before-scroll");
+    appendDebugLog("snapshot-before-scroll", {
+      tabId,
+      url: target.url,
+      snapshot: beforeScrollSnapshot
+    });
+
+    setStatus({
+      message:
+        batchSize > 1
+          ? `同时打开 ${batchSize} 个后台标签页；第 ${index + 1}/${total} 个正在滚动加载，预计等待 ${waitSeconds} 秒。`
+          : `第 ${index + 1}/${total} 个后台标签页正在滚动加载，预计等待 ${waitSeconds} 秒。`
+    });
+    const scrollResult = await scrollTabToBottom(tabId, waitSeconds);
+    appendDebugLog("scroll-result", {
+      tabId,
+      url: target.url,
+      scrollResult
+    });
+
+    const afterScrollSnapshot = await collectDebugSnapshot(tabId, "after-scroll");
+    appendDebugLog("snapshot-after-scroll", {
+      tabId,
+      url: target.url,
+      snapshot: afterScrollSnapshot
+    });
+
+    analyzeTargetOutcome(target, beforeScrollSnapshot, scrollResult, afterScrollSnapshot);
+    appendDebugLog("target-timing", {
+      page: target.page,
+      url: target.url,
+      elapsedMs: Date.now() - startedAt
+    });
+  } finally {
+    if (currentTask?.activeTabId === tabId) {
+      currentTask.activeTabId = null;
+      await persistActiveTask();
+    }
+  }
 }
 
 function analyzeTargetOutcome(target, beforeScrollSnapshot, scrollResult, afterScrollSnapshot) {
@@ -338,18 +484,23 @@ function analyzeTargetOutcome(target, beforeScrollSnapshot, scrollResult, afterS
   const visibilityState =
     afterScrollSnapshot?.visibilityState || scrollResult?.visibilityState || "unknown";
 
-  if (visibilityState === "hidden") {
+  if (
+    visibilityState === "hidden" &&
+    afterImages &&
+    (afterImages.pending > 0 || afterImages.lazy > 0)
+  ) {
     appendDebugLog("background-visibility-warning", {
       page: target.page,
       url: target.url,
       message:
-        "This page stayed hidden while loading. Some lazy-load implementations stall in background tabs."
+        "页面加载时仍处于隐藏状态，部分懒加载实现可能不会触发。"
     });
   }
 
   if (
     beforeImages &&
     afterImages &&
+    (beforeImages.total > 0 || afterImages.total > 0) &&
     afterImages.complete <= beforeImages.complete &&
     afterImages.pending >= beforeImages.pending
   ) {
@@ -359,7 +510,7 @@ function analyzeTargetOutcome(target, beforeScrollSnapshot, scrollResult, afterS
       beforeImages,
       afterImages,
       message:
-        "Image completion did not improve after scrolling. The site may require foreground visibility or a different scroll trigger."
+        "滚动后图片完成数量没有增加，站点可能需要前台可见性或其他滚动触发方式。"
     });
   }
 
@@ -375,22 +526,28 @@ function analyzeTargetOutcome(target, beforeScrollSnapshot, scrollResult, afterS
   }
 }
 
-function waitForTabComplete(tabId, timeoutMs) {
+function waitForTabReady(tabId, timeoutMs) {
   return new Promise((resolve, reject) => {
     let settled = false;
+    const startedAt = Date.now();
 
     const timeoutId = setTimeout(() => {
       cleanup();
-      reject(new Error(`Page load timed out after ${timeoutMs}ms.`));
+      resolve({
+        reason: "timeout",
+        elapsedMs: Date.now() - startedAt
+      });
     }, timeoutMs);
 
     const onUpdated = (updatedTabId, changeInfo) => {
-      if (updatedTabId !== tabId || changeInfo.status !== "complete") {
+      if (
+        updatedTabId !== tabId ||
+        (changeInfo.status !== "loading" && changeInfo.status !== "complete")
+      ) {
         return;
       }
 
-      cleanup();
-      resolve();
+      checkReady(`tabs-${changeInfo.status}`);
     };
 
     const onRemoved = (removedTabId) => {
@@ -399,7 +556,7 @@ function waitForTabComplete(tabId, timeoutMs) {
       }
 
       cleanup();
-      reject(new Error("The tab was closed before loading completed."));
+      reject(new Error("标签页在加载完成前已关闭。"));
     };
 
     const cleanup = () => {
@@ -416,18 +573,50 @@ function waitForTabComplete(tabId, timeoutMs) {
     chrome.tabs.onUpdated.addListener(onUpdated);
     chrome.tabs.onRemoved.addListener(onRemoved);
 
-    void chrome.tabs
-      .get(tabId)
-      .then((tab) => {
-        if (tab.status === "complete") {
+    checkReady("initial");
+
+    function checkReady(reason) {
+      chrome.scripting
+        .executeScript({
+          target: { tabId },
+          func: () => ({
+            readyState: document.readyState,
+            href: location.href
+          })
+        })
+        .then(([{ result } = {}]) => {
+          if (settled || !result) {
+            return;
+          }
+
           cleanup();
-          resolve();
-        }
-      })
-      .catch((error) => {
-        cleanup();
-        reject(error);
-      });
+          resolve({
+            reason,
+            readyState: result.readyState,
+            href: result.href,
+            elapsedMs: Date.now() - startedAt
+          });
+        })
+        .catch(() => {
+          void chrome.tabs
+            .get(tabId)
+            .then((tab) => {
+              if (settled || tab.status !== "complete") {
+                return;
+              }
+
+              cleanup();
+              resolve({
+                reason: "tab-complete",
+                elapsedMs: Date.now() - startedAt
+              });
+            })
+            .catch((error) => {
+              cleanup();
+              reject(error);
+            });
+        });
+    }
   });
 }
 
@@ -463,8 +652,8 @@ async function collectDebugSnapshot(tabId, label) {
 async function togglePanelForTab(tab) {
   if (!tab?.id || !isInjectableUrl(tab.url)) {
     await notifyCompletion(
-      "Cannot open panel",
-      "Open a normal http/https page first, then click the extension again."
+      "无法打开面板",
+      "请先打开普通 http/https 页面，然后再次点击扩展。"
     );
     return;
   }
@@ -480,15 +669,15 @@ async function togglePanelForTab(tab) {
       files: PANEL_FILES.js
     });
   } catch (error) {
-    console.error("Failed to inject panel:", error);
+    console.error("注入面板失败:", error);
     appendDebugLog("panel-injection-failure", {
       tabId: tab.id,
       url: tab.url,
       error: toLoggableError(error)
     });
     await notifyCompletion(
-      "Panel injection failed",
-      "Chrome blocked script injection on this page."
+      "面板注入失败",
+      "Chrome 阻止了在当前页面注入脚本。"
     );
   }
 }
@@ -510,6 +699,64 @@ function performScrollToBottom(maxWaitMs) {
     );
 
   const getViewportHeight = () => Math.max(window.innerHeight || 0, 600);
+
+  const getScrollableTargets = () => {
+    const targets = [window];
+    const nodes = Array.from(document.querySelectorAll("body *"));
+    const scrollableNodes = nodes
+      .filter((node) => {
+        const style = window.getComputedStyle(node);
+        const overflowY = style.overflowY;
+        return (
+          node.scrollHeight - node.clientHeight > 8 &&
+          (overflowY === "auto" || overflowY === "scroll" || overflowY === "overlay")
+        );
+      })
+      .sort(
+        (first, second) =>
+          second.scrollHeight - second.clientHeight - (first.scrollHeight - first.clientHeight)
+      )
+      .slice(0, 20);
+
+    return targets.concat(scrollableNodes);
+  };
+
+  const getTargetScrollTop = (target) => {
+    if (target === window) {
+      return window.scrollY || document.documentElement.scrollTop || 0;
+    }
+
+    return target.scrollTop || 0;
+  };
+
+  const getTargetViewportHeight = (target) => {
+    if (target === window) {
+      return getViewportHeight();
+    }
+
+    return Math.max(target.clientHeight || 0, 1);
+  };
+
+  const getTargetMaxScrollTop = (target) => {
+    if (target === window) {
+      return Math.max(getScrollHeight() - getViewportHeight(), 0);
+    }
+
+    return Math.max((target.scrollHeight || 0) - (target.clientHeight || 0), 0);
+  };
+
+  const scrollTargetTo = (target, top) => {
+    if (target === window) {
+      window.scrollTo({
+        top,
+        behavior: "auto"
+      });
+      return;
+    }
+
+    target.scrollTop = top;
+    target.dispatchEvent(new Event("scroll", { bubbles: true }));
+  };
 
   const getImageStats = () => {
     const images = Array.from(document.images);
@@ -579,21 +826,40 @@ function performScrollToBottom(maxWaitMs) {
   };
 
   const progressiveScroll = () => {
-    const viewport = getViewportHeight();
-    const scrollTop = window.scrollY || document.documentElement.scrollTop || 0;
-    const maxScrollTop = Math.max(getScrollHeight() - viewport, 0);
-    const stepSize = Math.max(Math.floor(viewport * 0.85), 240);
-    const nextTop = Math.min(scrollTop + stepSize, maxScrollTop);
+    const scrollTargets = getScrollableTargets();
+    let pageState = null;
+    let remainingScrollable = 0;
 
-    window.scrollTo({
-      top: nextTop,
-      behavior: "auto"
-    });
+    for (const target of scrollTargets) {
+      const viewport = getTargetViewportHeight(target);
+      const scrollTop = getTargetScrollTop(target);
+      const maxScrollTop = getTargetMaxScrollTop(target);
+      const stepSize = Math.max(Math.floor(viewport * 0.85), 240);
+      const nextTop = Math.min(scrollTop + stepSize, maxScrollTop);
+
+      scrollTargetTo(target, nextTop);
+
+      if (nextTop < maxScrollTop - 4) {
+        remainingScrollable += 1;
+      }
+
+      if (target === window) {
+        pageState = {
+          nextTop,
+          maxScrollTop,
+          viewport
+        };
+      }
+    }
 
     return {
-      nextTop,
-      maxScrollTop,
-      viewport
+      ...(pageState || {
+        nextTop: 0,
+        maxScrollTop: 0,
+        viewport: getViewportHeight()
+      }),
+      scrollableTargets: scrollTargets.length,
+      remainingScrollable
     };
   };
 
@@ -618,13 +884,18 @@ function performScrollToBottom(maxWaitMs) {
         top: Math.max(getScrollHeight() - scrollState.viewport, 0),
         behavior: "auto"
       });
+      for (const target of getScrollableTargets()) {
+        scrollTargetTo(target, getTargetMaxScrollTop(target));
+      }
       pokePageObservers();
 
       await sleep(900);
 
       const height = getScrollHeight();
       const stats = getImageStats();
-      const nearBottom = window.scrollY + scrollState.viewport >= height - 4;
+      const nearBottom =
+        window.scrollY + scrollState.viewport >= height - 4 &&
+        scrollState.remainingScrollable === 0;
 
       rounds.push({
         height,
@@ -632,6 +903,8 @@ function performScrollToBottom(maxWaitMs) {
         complete: stats.complete,
         scrollY: window.scrollY,
         nearBottom,
+        scrollableTargets: scrollState.scrollableTargets,
+        remainingScrollable: scrollState.remainingScrollable,
         visibility: document.visibilityState
       });
 
@@ -663,6 +936,9 @@ function performScrollToBottom(maxWaitMs) {
       top: getScrollHeight(),
       behavior: "auto"
     });
+    for (const target of getScrollableTargets()) {
+      scrollTargetTo(target, getTargetMaxScrollTop(target));
+    }
     pokePageObservers();
 
     return {
@@ -950,7 +1226,7 @@ function collectDebugSnapshotInPage(label) {
     title: document.title,
     visibilityState: document.visibilityState,
     hidden: document.hidden,
-    message: "debug probe not installed"
+    message: "诊断探针未安装"
   };
 }
 
@@ -962,12 +1238,14 @@ function incrementStatus(key) {
 
 function finishTask({ phase, message }) {
   currentTask = null;
+  void clearActiveTask();
+  clearTaskAlarm();
   setStatus({
     phase,
     message
   });
   void notifyCompletion(
-    phase === "failed-partial" ? "Preload finished with warnings" : "Preload finished",
+    phase === "failed-partial" ? "预加载完成但存在警告" : "预加载完成",
     message
   );
 }
@@ -985,6 +1263,40 @@ function setStatus(patch) {
   broadcastStatus(currentStatus);
 }
 
+async function persistActiveTask() {
+  if (!currentTask) {
+    return;
+  }
+
+  await chrome.storage.local.set({
+    [ACTIVE_TASK_STORAGE_KEY]: {
+      id: currentTask.id,
+      phase: currentTask.phase,
+      targets: currentTask.targets,
+      waitSeconds: currentTask.waitSeconds,
+      concurrentTabs: currentTask.concurrentTabs || 1,
+      nextIndex: currentTask.nextIndex || 0,
+      activeTabId: currentTask.activeTabId || null,
+      startedAt: currentTask.startedAt
+    }
+  });
+}
+
+async function clearActiveTask() {
+  await chrome.storage.local.remove(ACTIVE_TASK_STORAGE_KEY);
+}
+
+function ensureTaskAlarm() {
+  chrome.alarms.create(TASK_ALARM_NAME, {
+    delayInMinutes: 1,
+    periodInMinutes: 1
+  });
+}
+
+function clearTaskAlarm() {
+  chrome.alarms.clear(TASK_ALARM_NAME).catch(() => {});
+}
+
 async function persistStatus(status) {
   await chrome.storage.session.set({
     [STATUS_STORAGE_KEY]: status
@@ -999,6 +1311,15 @@ async function persistDebugLogs() {
 
 function broadcastStatus(status) {
   chrome.runtime.sendMessage({ type: "STATUS_UPDATE", status }).catch(() => {});
+  for (const port of connectedPanelPorts) {
+    try {
+      port.postMessage({ type: "STATUS_UPDATE", status });
+    } catch (error) {
+      appendDebugLog("panel-port-status-failed", {
+        error: toLoggableError(error)
+      });
+    }
+  }
 }
 
 async function notifyCompletion(title, message) {
@@ -1011,7 +1332,7 @@ async function notifyCompletion(title, message) {
       message
     });
   } catch (error) {
-    console.warn("Notification unavailable:", error);
+    console.warn("通知不可用:", error);
   }
 }
 
@@ -1027,18 +1348,66 @@ function appendDebugLog(type, payload) {
   }
 
   void persistDebugLogs().catch((error) => {
-    console.warn("Failed to persist debug logs:", error);
+    console.warn("保存诊断日志失败:", error);
   });
 }
 
 async function restorePersistedState() {
-  const stored = await chrome.storage.session.get([
-    STATUS_STORAGE_KEY,
-    DEBUG_LOGS_STORAGE_KEY
+  if (currentTask?.phase === "running") {
+    ensureTaskAlarm();
+    startTaskRunner(currentTask.id);
+    return;
+  }
+
+  const [sessionStored, localStored] = await Promise.all([
+    chrome.storage.session.get([STATUS_STORAGE_KEY, DEBUG_LOGS_STORAGE_KEY]),
+    chrome.storage.local.get(ACTIVE_TASK_STORAGE_KEY)
   ]);
 
-  currentStatus = stored[STATUS_STORAGE_KEY] || createIdleStatus();
-  debugLogs = stored[DEBUG_LOGS_STORAGE_KEY] || [];
+  currentStatus = sessionStored[STATUS_STORAGE_KEY] || createIdleStatus();
+  debugLogs = sessionStored[DEBUG_LOGS_STORAGE_KEY] || [];
+
+  const activeTask = localStored[ACTIVE_TASK_STORAGE_KEY];
+  if (isRestorableTask(activeTask)) {
+    if (activeTask.activeTabId) {
+      appendDebugLog("stale-tab-left-open", {
+        tabId: activeTask.activeTabId,
+        message: "扩展后台重启前正在处理的标签页已保留，任务将从当前页重新开始。"
+      });
+      activeTask.activeTabId = null;
+      await chrome.storage.local.set({
+        [ACTIVE_TASK_STORAGE_KEY]: activeTask
+      });
+    }
+
+    taskSequence = Math.max(taskSequence, activeTask.id || 0);
+    currentTask = {
+      ...activeTask,
+      phase: "running"
+    };
+
+    if (currentStatus.phase !== "running") {
+      setStatus({
+        phase: "running",
+        total: activeTask.targets.length,
+        currentIndex: activeTask.nextIndex || 0,
+        successCount: currentStatus.successCount || 0,
+        failureCount: currentStatus.failureCount || 0,
+        message: "扩展后台重启后已恢复未完成任务。",
+        startedAt: activeTask.startedAt || new Date().toISOString()
+      });
+    }
+
+    appendDebugLog("task-resume", {
+      taskId: activeTask.id,
+      nextIndex: activeTask.nextIndex || 0,
+      total: activeTask.targets.length
+    });
+
+    ensureTaskAlarm();
+    startTaskRunner(activeTask.id);
+    return;
+  }
 
   if (currentStatus.phase === "running") {
     currentTask = null;
@@ -1046,10 +1415,25 @@ async function restorePersistedState() {
       ...createIdleStatus(),
       phase: "failed-partial",
       message:
-        "The extension worker restarted while a task was running. This is a common MV3 failure mode."
+        "扩展后台在任务运行中重启，任务已标记为部分失败。"
     };
     void persistStatus(currentStatus);
   }
+}
+
+function isRestorableTask(task) {
+  return (
+    task &&
+    task.phase === "running" &&
+    Number.isInteger(task.id) &&
+    Array.isArray(task.targets) &&
+    task.targets.length > 0 &&
+    Number.isInteger(task.waitSeconds) &&
+    (!task.concurrentTabs || Number.isInteger(task.concurrentTabs)) &&
+    Number.isInteger(task.nextIndex) &&
+    task.nextIndex >= 0 &&
+    task.nextIndex <= task.targets.length
+  );
 }
 
 function toLoggableError(error) {
