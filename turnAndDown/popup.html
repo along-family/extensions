@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Lazy Page Preloader</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <main class="app">
+      <h1 class="title">懒加载预加载器</h1>
+
+      <form id="preload-form" class="form">
+        <label class="field">
+          <span class="label">分页 URL</span>
+          <textarea
+            id="url"
+            name="url"
+            rows="3"
+            placeholder="https://example.com/list?page=10"
+            required
+          ></textarea>
+        </label>
+
+        <div class="row">
+          <label class="field">
+            <span class="label">翻页数量</span>
+            <input
+              id="count"
+              name="count"
+              type="number"
+              min="1"
+              max="20"
+              inputmode="numeric"
+              required
+            />
+          </label>
+
+          <label class="field">
+            <span class="label">等待秒数</span>
+            <input
+              id="waitSeconds"
+              name="waitSeconds"
+              type="number"
+              min="3"
+              max="30"
+              inputmode="numeric"
+              required
+            />
+          </label>
+        </div>
+
+        <button id="start-button" type="submit" class="button">开始预加载</button>
+      </form>
+
+      <section class="status-panel">
+        <h2 class="status-title">状态</h2>
+        <p id="status-message" class="status-message">等待开始</p>
+        <dl class="status-grid">
+          <div>
+            <dt>阶段</dt>
+            <dd id="phase">idle</dd>
+          </div>
+          <div>
+            <dt>进度</dt>
+            <dd id="progress">0 / 0</dd>
+          </div>
+          <div>
+            <dt>成功</dt>
+            <dd id="success-count">0</dd>
+          </div>
+          <div>
+            <dt>失败</dt>
+            <dd id="failure-count">0</dd>
+          </div>
+        </dl>
+      </section>
+
+      <section class="status-panel">
+        <div class="log-header">
+          <h2 class="status-title">诊断日志</h2>
+          <div class="log-actions">
+            <button id="refresh-logs-button" type="button" class="button secondary-button">
+              刷新日志
+            </button>
+            <button id="clear-logs-button" type="button" class="button secondary-button">
+              清空日志
+            </button>
+          </div>
+        </div>
+        <textarea
+          id="debug-logs"
+          class="debug-logs"
+          rows="12"
+          readonly
+          placeholder="这里会显示后台保存的诊断日志"
+        ></textarea>
+      </section>
+    </main>
+
+    <script type="module" src="popup.js"></script>
+  </body>
+</html>

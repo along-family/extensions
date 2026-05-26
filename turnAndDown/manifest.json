@@ -1,0 +1,22 @@
+{
+  "manifest_version": 3,
+  "name": "Lazy Page Preloader",
+  "version": "1.0.0",
+  "description": "Preload paginated pages in background tabs for lazy-loading websites.",
+  "permissions": [
+    "notifications",
+    "scripting",
+    "storage",
+    "tabs"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "action": {
+    "default_title": "Lazy Page Preloader"
+  }
+}

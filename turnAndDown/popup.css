@@ -1,0 +1,160 @@
+:root {
+  color-scheme: light;
+  font-family: "Microsoft YaHei", "PingFang SC", sans-serif;
+  background: #f4f1ea;
+  color: #1f1f1f;
+}
+
+body {
+  margin: 0;
+  min-width: 360px;
+  background:
+    radial-gradient(circle at top left, rgba(208, 131, 76, 0.28), transparent 40%),
+    linear-gradient(180deg, #faf5ec 0%, #efe6d7 100%);
+}
+
+.app {
+  padding: 16px;
+}
+
+.title,
+.status-title {
+  margin: 0;
+  font-weight: 700;
+  letter-spacing: 0;
+}
+
+.title {
+  font-size: 20px;
+}
+
+.form {
+  display: grid;
+  gap: 12px;
+  margin-top: 16px;
+}
+
+.field {
+  display: grid;
+  gap: 6px;
+}
+
+.label {
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.row {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+textarea,
+input,
+button {
+  font: inherit;
+}
+
+textarea,
+input {
+  width: 100%;
+  box-sizing: border-box;
+  border: 1px solid rgba(61, 47, 30, 0.18);
+  border-radius: 8px;
+  padding: 10px 12px;
+  background: rgba(255, 252, 247, 0.88);
+  color: inherit;
+}
+
+textarea {
+  resize: vertical;
+  min-height: 84px;
+}
+
+textarea:focus,
+input:focus {
+  outline: 2px solid rgba(170, 92, 37, 0.35);
+  border-color: rgba(170, 92, 37, 0.45);
+}
+
+.button {
+  border: 0;
+  border-radius: 8px;
+  padding: 11px 14px;
+  background: linear-gradient(135deg, #bb6032 0%, #8d3b23 100%);
+  color: #fffaf4;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.button:disabled {
+  cursor: wait;
+  opacity: 0.7;
+}
+
+.status-panel {
+  margin-top: 16px;
+  border: 1px solid rgba(61, 47, 30, 0.12);
+  border-radius: 8px;
+  padding: 14px;
+  background: rgba(255, 250, 244, 0.78);
+}
+
+.status-message {
+  margin: 10px 0 0;
+  min-height: 40px;
+  line-height: 1.5;
+}
+
+.status-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px 12px;
+  margin: 14px 0 0;
+}
+
+.status-grid div {
+  padding: 10px;
+  border-radius: 8px;
+  background: rgba(237, 228, 214, 0.75);
+}
+
+.status-grid dt {
+  font-size: 12px;
+  color: #5c4d3c;
+}
+
+.status-grid dd {
+  margin: 6px 0 0;
+  font-size: 16px;
+  font-weight: 700;
+}
+
+.log-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.log-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.secondary-button {
+  padding: 8px 10px;
+  background: rgba(255, 250, 244, 0.9);
+  color: #8d3b23;
+  border: 1px solid rgba(141, 59, 35, 0.22);
+}
+
+.debug-logs {
+  margin-top: 12px;
+  min-height: 220px;
+  font-family: Consolas, "Courier New", monospace;
+  font-size: 12px;
+  line-height: 1.45;
+  white-space: pre;
+}
