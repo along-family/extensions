@@ -88,9 +88,20 @@ input:focus {
   cursor: pointer;
 }
 
+.form-actions {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 10px;
+}
+
 .button:disabled {
   cursor: wait;
   opacity: 0.7;
+}
+
+.stop-button {
+  min-width: 82px;
+  background: #8f2f22;
 }
 
 .status-panel {

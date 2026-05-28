@@ -14,6 +14,7 @@ const urlField = document.querySelector("#url");
 const countField = document.querySelector("#count");
 const waitField = document.querySelector("#waitSeconds");
 const startButton = document.querySelector("#start-button");
+const stopButton = document.querySelector("#stop-button");
 const statusMessage = document.querySelector("#status-message");
 const phaseValue = document.querySelector("#phase");
 const progressValue = document.querySelector("#progress");
@@ -102,6 +103,33 @@ clearLogsButton?.addEventListener("click", async () => {
   }
 });
 
+stopButton?.addEventListener("click", async () => {
+  stopButton.disabled = true;
+  stopButton.textContent = "停止中...";
+
+  try {
+    const response = await chrome.runtime.sendMessage({ type: "STOP_PRELOAD" });
+    if (response?.ok && response.status) {
+      renderStatus(response.status);
+      await loadDebugLogs();
+      return;
+    }
+
+    renderStatus({
+      ...createIdleStatus(),
+      message: response?.message || "停止失败，请重试。"
+    });
+  } catch (error) {
+    console.error("Failed to stop task:", error);
+    renderStatus({
+      ...createIdleStatus(),
+      message: "停止失败，请检查扩展后台。"
+    });
+  } finally {
+    stopButton.textContent = "停止";
+  }
+});
+
 chrome.runtime.onMessage.addListener((message) => {
   if (message?.type === "STATUS_UPDATE" && message.status) {
     renderStatus(message.status);
@@ -165,6 +193,9 @@ function renderStatus(status) {
   progressValue.textContent = `${safeStatus.currentIndex || 0} / ${safeStatus.total || 0}`;
   successCountValue.textContent = String(safeStatus.successCount || 0);
   failureCountValue.textContent = String(safeStatus.failureCount || 0);
+  if (stopButton) {
+    stopButton.disabled = safeStatus.phase !== "running";
+  }
 }
 
 function setBusy(isBusy) {

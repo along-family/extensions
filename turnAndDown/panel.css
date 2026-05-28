@@ -69,6 +69,12 @@
   gap: 12px;
 }
 
+#lazy-page-preloader-root .lpp-form-actions {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 10px;
+}
+
 #lazy-page-preloader-root .lpp-field {
   flex: 1 1 0;
   min-width: 0;
@@ -109,6 +115,7 @@
 }
 
 #lazy-page-preloader-root .lpp-primary-button,
+#lazy-page-preloader-root .lpp-stop-button,
 #lazy-page-preloader-root .lpp-secondary-button,
 #lazy-page-preloader-root .lpp-icon-button {
   border: 0;
@@ -125,6 +132,19 @@
 
 #lazy-page-preloader-root .lpp-primary-button:disabled {
   opacity: 0.7;
+  cursor: wait;
+}
+
+#lazy-page-preloader-root .lpp-stop-button {
+  min-width: 82px;
+  padding: 11px 14px;
+  background: #8f2f22;
+  color: #fffaf4;
+  font-weight: 700;
+}
+
+#lazy-page-preloader-root .lpp-stop-button:disabled {
+  opacity: 0.55;
   cursor: wait;
 }
 

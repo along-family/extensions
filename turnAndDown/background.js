@@ -14,6 +14,13 @@ let taskSequence = 0;
 let debugLogs = [];
 
 const MAX_DEBUG_LOGS = 400;
+const SCRIPT_EXECUTION_TIMEOUT_MS = 6000;
+const SCRIPT_EXECUTION_TIMEOUT_BUFFER_MS = 5000;
+const SCROLL_SCRIPT_RETURN_BUFFER_MS = 1200;
+const SCROLL_TO_TOP_DELAY_MS = 20000;
+const MIN_TARGET_TIMEOUT_MS = 45000;
+const TARGET_TIMEOUT_BUFFER_MS = 35000;
+const MAX_DEBUG_LOG_PAYLOAD_CHARS = 5000;
 const PANEL_PORT_NAME = "lazy-page-preloader-panel";
 const ACTIVE_TASK_STORAGE_KEY = "activePreloadTask";
 const TASK_ALARM_NAME = "lazy-page-preloader-active-task";
@@ -24,6 +31,7 @@ const PANEL_FILES = {
 
 const connectedPanelPorts = new Set();
 let taskRunnerPromise = null;
+let taskRunnerTaskId = null;
 
 chrome.runtime.onInstalled.addListener(() => {
   void persistStatus(currentStatus);
@@ -80,7 +88,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   }
 
   if (message.type === "GET_DEBUG_LOGS") {
-    sendResponse({ ok: true, logs: debugLogs });
+    sendResponse({ ok: true, logs: getRecentDebugLogs(message.limit) });
     return false;
   }
 
@@ -91,7 +99,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         sendResponse({
           ok: true,
           status: currentStatus,
-          logs: debugLogs,
+          logCount: debugLogs.length,
           lastInput: stored[LAST_INPUT_STORAGE_KEY] || null
         });
       })
@@ -109,6 +117,21 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     void persistDebugLogs();
     sendResponse({ ok: true });
     return false;
+  }
+
+  if (message.type === "STOP_PRELOAD") {
+    void stopCurrentTask("user-request")
+      .then((response) => {
+        sendResponse(response);
+      })
+      .catch((error) => {
+        console.error("Failed to stop preload task:", error);
+        sendResponse({
+          ok: false,
+          message: error?.message || "Failed to stop preload task."
+        });
+      });
+    return true;
   }
 
   if (message.type === "PAGE_DEBUG_EVENT") {
@@ -211,10 +234,11 @@ function beginPreloadTask(payload) {
 }
 
 function startTaskRunner(taskId) {
-  if (taskRunnerPromise || !isCurrentTask(taskId)) {
+  if ((taskRunnerPromise && taskRunnerTaskId === taskId) || !isCurrentTask(taskId)) {
     return;
   }
 
+  taskRunnerTaskId = taskId;
   taskRunnerPromise = Promise.resolve()
     .then(async () => {
       const task = currentTask;
@@ -247,7 +271,10 @@ function startTaskRunner(taskId) {
       });
     })
     .finally(() => {
-      taskRunnerPromise = null;
+      if (taskRunnerTaskId === taskId) {
+        taskRunnerPromise = null;
+        taskRunnerTaskId = null;
+      }
     });
 }
 
@@ -342,7 +369,14 @@ async function runTarget(taskId, target, waitSeconds, index, total, batchSize) {
       batchSize
     });
 
-    await processTarget(target, waitSeconds, index, total, batchSize);
+    await withTargetTimeout(
+      processTarget(target, waitSeconds, index, total, batchSize),
+      target,
+      waitSeconds
+    );
+    if (!isCurrentTask(taskId)) {
+      return;
+    }
 
     appendDebugLog("target-success", {
       taskId,
@@ -355,10 +389,32 @@ async function runTarget(taskId, target, waitSeconds, index, total, batchSize) {
 
     incrementStatus("successCount");
     setStatus({
-      currentIndex: currentStatus.successCount + currentStatus.failureCount,
+      currentIndex: getCompletedProgress(index),
       message: `已完成第 ${index + 1}/${total} 个页面：page=${target.page}`
     });
   } catch (error) {
+    if (!isCurrentTask(taskId)) {
+      return;
+    }
+
+    if (isExpectedTargetInterruption(error)) {
+      appendDebugLog("target-interrupted", {
+        taskId,
+        index,
+        page: target.page,
+        url: target.url,
+        tabId: target.tabId || null,
+        batchSize,
+        error: toLoggableError(error)
+      });
+      incrementStatus("failureCount");
+      setStatus({
+        currentIndex: getCompletedProgress(index),
+        message: `page=${target.page} 处理中断，已跳过并继续下一个页面。`
+      });
+      return;
+    }
+
     console.error(
       `[LazyPagePreloader] 处理失败: page=${target.page} url=${target.url}`,
       error
@@ -376,7 +432,7 @@ async function runTarget(taskId, target, waitSeconds, index, total, batchSize) {
 
     incrementStatus("failureCount");
     setStatus({
-      currentIndex: currentStatus.successCount + currentStatus.failureCount,
+      currentIndex: getCompletedProgress(index),
       message: `page=${target.page} 处理失败，继续下一个页面。`
     });
   }
@@ -387,6 +443,21 @@ async function processTarget(target, waitSeconds, index, total, batchSize) {
   const startedAt = Date.now();
 
   try {
+    if (tabId) {
+      const existingTab = await getExistingTab(tabId);
+      if (!existingTab) {
+        appendDebugLog("stale-target-tab-cleared", {
+          tabId,
+          page: target.page,
+          url: target.url
+        });
+
+        target.tabId = null;
+        tabId = null;
+        await persistActiveTask();
+      }
+    }
+
     if (!tabId) {
       const createdTab = await chrome.tabs.create({
         url: target.url,
@@ -465,6 +536,25 @@ async function processTarget(target, waitSeconds, index, total, batchSize) {
     });
 
     analyzeTargetOutcome(target, beforeScrollSnapshot, scrollResult, afterScrollSnapshot);
+
+    try {
+      const topScrollScheduleResult = await scheduleScrollTabToTop(
+        tabId,
+        SCROLL_TO_TOP_DELAY_MS
+      );
+      appendDebugLog("scroll-top-scheduled", {
+        tabId,
+        url: target.url,
+        topScrollScheduleResult
+      });
+    } catch (error) {
+      appendDebugLog("scroll-top-schedule-failed", {
+        tabId,
+        url: target.url,
+        error: toLoggableError(error)
+      });
+    }
+
     appendDebugLog("target-timing", {
       page: target.page,
       url: target.url,
@@ -475,6 +565,18 @@ async function processTarget(target, waitSeconds, index, total, batchSize) {
       currentTask.activeTabId = null;
       await persistActiveTask();
     }
+  }
+}
+
+async function getExistingTab(tabId) {
+  try {
+    return await chrome.tabs.get(tabId);
+  } catch (error) {
+    if (error?.message?.includes("No tab with id")) {
+      return null;
+    }
+
+    throw error;
   }
 }
 
@@ -621,36 +723,121 @@ function waitForTabReady(tabId, timeoutMs) {
 }
 
 async function scrollTabToBottom(tabId, waitSeconds) {
-  const [{ result } = {}] = await chrome.scripting.executeScript({
-    target: { tabId },
-    func: performScrollToBottom,
-    args: [waitSeconds * 1000]
-  });
+  let scriptResult = null;
+  try {
+    scriptResult = await executeScriptWithTimeout(
+      {
+        target: { tabId },
+        func: performScrollToBottom,
+        args: [waitSeconds * 1000, SCROLL_SCRIPT_RETURN_BUFFER_MS]
+      },
+      waitSeconds * 1000 + SCRIPT_EXECUTION_TIMEOUT_BUFFER_MS,
+      "scroll-tab-to-bottom"
+    );
+  } catch (error) {
+    if (!isScriptExecutionTimeout(error)) {
+      throw error;
+    }
+
+    appendDebugLog("scroll-timeout-handled", {
+      tabId,
+      error: toLoggableError(error)
+    });
+    return {
+      timedOut: true,
+      timeoutHandled: true,
+      elapsedMs: error.details?.timeoutMs || null,
+      reason: "scroll-tab-to-bottom-timeout"
+    };
+  }
+
+  const [{ result } = {}] = scriptResult;
+  return result || null;
+}
+
+async function scheduleScrollTabToTop(tabId, delayMs) {
+  const [{ result } = {}] = await executeScriptWithTimeout(
+    {
+      target: { tabId },
+      func: scheduleScrollToTopInPage,
+      args: [delayMs]
+    },
+    SCRIPT_EXECUTION_TIMEOUT_MS,
+    "schedule-scroll-to-top"
+  );
 
   return result || null;
 }
 
 async function installDebugProbe(tabId) {
-  const [{ result } = {}] = await chrome.scripting.executeScript({
-    target: { tabId },
-    func: installDebugProbeInPage
-  });
+  const [{ result } = {}] = await executeScriptWithTimeout(
+    {
+      target: { tabId },
+      func: installDebugProbeInPage
+    },
+    SCRIPT_EXECUTION_TIMEOUT_MS,
+    "install-debug-probe"
+  );
 
   return result || null;
 }
 
 async function collectDebugSnapshot(tabId, label) {
-  const [{ result } = {}] = await chrome.scripting.executeScript({
-    target: { tabId },
-    func: collectDebugSnapshotInPage,
-    args: [label]
+  try {
+    const [{ result } = {}] = await executeScriptWithTimeout(
+      {
+        target: { tabId },
+        func: collectDebugSnapshotInPage,
+        args: [label]
+      },
+      SCRIPT_EXECUTION_TIMEOUT_MS,
+      `collect-debug-snapshot:${label}`
+    );
+
+    return result || null;
+  } catch (error) {
+    appendDebugLog("snapshot-collect-failed", {
+      tabId,
+      label,
+      error: toLoggableError(error)
+    });
+    return null;
+  }
+}
+
+async function executeScriptWithTimeout(scriptOptions, timeoutMs, label) {
+  const tabId = scriptOptions?.target?.tabId || null;
+  const normalizedTimeoutMs = Math.max(Number(timeoutMs) || 0, 1000);
+  let timeoutId = null;
+
+  const timeoutPromise = new Promise((_, reject) => {
+    timeoutId = setTimeout(() => {
+      const error = new Error(`Script execution timed out: ${label}`);
+      error.name = "ScriptExecutionTimeoutError";
+      error.details = {
+        label,
+        tabId,
+        timeoutMs: normalizedTimeoutMs
+      };
+
+      appendDebugLog("script-execution-timeout", error.details);
+      reject(error);
+    }, normalizedTimeoutMs);
   });
 
-  return result || null;
+  try {
+    return await Promise.race([
+      chrome.scripting.executeScript(scriptOptions),
+      timeoutPromise
+    ]);
+  } finally {
+    clearTimeout(timeoutId);
+  }
 }
 
 async function togglePanelForTab(tab) {
-  if (!tab?.id || !isInjectableUrl(tab.url)) {
+  const targetTab = await resolvePanelTargetTab(tab);
+  if (!targetTab?.id || !isInjectableUrl(targetTab.url)) {
     await notifyCompletion(
       "无法打开面板",
       "请先打开普通 http/https 页面，然后再次点击扩展。"
@@ -659,20 +846,24 @@ async function togglePanelForTab(tab) {
   }
 
   try {
+    if (targetTab.id !== tab?.id) {
+      await chrome.tabs.update(targetTab.id, { active: true }).catch(() => {});
+    }
+
     await chrome.scripting.insertCSS({
-      target: { tabId: tab.id },
+      target: { tabId: targetTab.id },
       files: PANEL_FILES.css
     });
 
     await chrome.scripting.executeScript({
-      target: { tabId: tab.id },
+      target: { tabId: targetTab.id },
       files: PANEL_FILES.js
     });
   } catch (error) {
     console.error("注入面板失败:", error);
     appendDebugLog("panel-injection-failure", {
-      tabId: tab.id,
-      url: tab.url,
+      tabId: targetTab.id,
+      url: targetTab.url,
       error: toLoggableError(error)
     });
     await notifyCompletion(
@@ -682,11 +873,84 @@ async function togglePanelForTab(tab) {
   }
 }
 
+async function resolvePanelTargetTab(tab) {
+  if (tab?.id && isInjectableUrl(tab.url)) {
+    return tab;
+  }
+
+  try {
+    const tabs = await chrome.tabs.query({
+      currentWindow: true
+    });
+    return (
+      tabs.find((candidate) => candidate.active && isInjectableUrl(candidate.url)) ||
+      tabs.find((candidate) => isInjectableUrl(candidate.url)) ||
+      tab
+    );
+  } catch (error) {
+    appendDebugLog("panel-target-tab-resolution-failed", {
+      tabId: tab?.id || null,
+      url: tab?.url || "",
+      error: toLoggableError(error)
+    });
+    return tab;
+  }
+}
+
 function isInjectableUrl(url) {
   return typeof url === "string" && /^https?:/i.test(url);
 }
 
-function performScrollToBottom(maxWaitMs) {
+function scheduleScrollToTopInPage(delayMs) {
+  const timerKey = "__lazyPagePreloaderScrollToTopTimer";
+  const normalizedDelayMs = Math.max(Number(delayMs) || 0, 0);
+  const getScrollableTargets = () => {
+    const targets = [window];
+    const nodes = Array.from(document.querySelectorAll("body *"));
+    const scrollableNodes = nodes
+      .filter((node) => {
+        const style = window.getComputedStyle(node);
+        const overflowY = style.overflowY;
+        return (
+          node.scrollHeight - node.clientHeight > 8 &&
+          (overflowY === "auto" || overflowY === "scroll" || overflowY === "overlay")
+        );
+      })
+      .slice(0, 20);
+
+    return targets.concat(scrollableNodes);
+  };
+
+  if (window[timerKey]) {
+    clearTimeout(window[timerKey]);
+  }
+
+  window[timerKey] = setTimeout(() => {
+    for (const target of getScrollableTargets()) {
+      if (target === window) {
+        window.scrollTo({
+          top: 0,
+          behavior: "auto"
+        });
+        continue;
+      }
+
+      target.scrollTop = 0;
+      target.dispatchEvent(new Event("scroll", { bubbles: true }));
+    }
+
+    window.dispatchEvent(new Event("scroll"));
+    document.dispatchEvent(new Event("scroll"));
+    window[timerKey] = null;
+  }, normalizedDelayMs);
+
+  return {
+    scheduled: true,
+    delayMs: normalizedDelayMs
+  };
+}
+
+function performScrollToBottom(maxWaitMs, returnBufferMs = 1000) {
   const sleep = (ms) =>
     new Promise((resolve) => {
       setTimeout(resolve, ms);
@@ -700,7 +964,7 @@ function performScrollToBottom(maxWaitMs) {
 
   const getViewportHeight = () => Math.max(window.innerHeight || 0, 600);
 
-  const getScrollableTargets = () => {
+  const getScrollableTargets = (limit = 8) => {
     const targets = [window];
     const nodes = Array.from(document.querySelectorAll("body *"));
     const scrollableNodes = nodes
@@ -716,7 +980,7 @@ function performScrollToBottom(maxWaitMs) {
         (first, second) =>
           second.scrollHeight - second.clientHeight - (first.scrollHeight - first.clientHeight)
       )
-      .slice(0, 20);
+      .slice(0, limit);
 
     return targets.concat(scrollableNodes);
   };
@@ -865,12 +1129,18 @@ function performScrollToBottom(maxWaitMs) {
 
   return (async () => {
     const startedAt = Date.now();
-    const deadline = startedAt + Math.max(maxWaitMs || 0, 1000);
+    const requestedWaitMs = Math.max(maxWaitMs || 0, 1000);
+    const safeReturnBufferMs = Math.min(
+      Math.max(Number(returnBufferMs) || 0, 500),
+      Math.max(Math.floor(requestedWaitMs / 2), 500)
+    );
+    const deadline = startedAt + Math.max(requestedWaitMs - safeReturnBufferMs, 500);
     const rounds = [];
     let stableRounds = 0;
     let lastHeight = -1;
     let lastCompleteCount = -1;
     let lastPendingCount = Number.POSITIVE_INFINITY;
+    let timedOut = false;
 
     while (Date.now() < deadline) {
       promoteLazyMedia();
@@ -931,6 +1201,7 @@ function performScrollToBottom(maxWaitMs) {
       }
     }
 
+    timedOut = Date.now() >= deadline;
     promoteLazyMedia();
     window.scrollTo({
       top: getScrollHeight(),
@@ -947,6 +1218,8 @@ function performScrollToBottom(maxWaitMs) {
       finalScrollY: window.scrollY,
       visibilityState: document.visibilityState,
       elapsedMs: Date.now() - startedAt,
+      requestedWaitMs,
+      timedOut,
       rounds,
       images: getImageStats()
     };
@@ -1105,12 +1378,6 @@ function installDebugProbeInPage() {
     if (state.events.length > maxStoredEvents) {
       state.events.shift();
     }
-
-    sendMessage("PAGE_DEBUG_EVENT", {
-      href: window.location.href,
-      title: document.title,
-      event
-    });
   };
 
   state.getSnapshot = (label) => {
@@ -1119,7 +1386,6 @@ function installDebugProbeInPage() {
       recentEvents: state.events.slice(-12)
     };
 
-    sendMessage("PAGE_DEBUG_SNAPSHOT", snapshot);
     return snapshot;
   };
 
@@ -1236,6 +1502,52 @@ function incrementStatus(key) {
   });
 }
 
+function getCompletedProgress(index) {
+  const countedProgress = (currentStatus.successCount || 0) + (currentStatus.failureCount || 0);
+  return Math.max(countedProgress, index + 1);
+}
+
+function getTargetTimeoutMs(waitSeconds) {
+  return Math.max(
+    MIN_TARGET_TIMEOUT_MS,
+    (Number(waitSeconds) || 0) * 1000 + TARGET_TIMEOUT_BUFFER_MS
+  );
+}
+
+function withTargetTimeout(promise, target, waitSeconds) {
+  const timeoutMs = getTargetTimeoutMs(waitSeconds);
+  let timeoutId = null;
+
+  const timeoutPromise = new Promise((_, reject) => {
+    timeoutId = setTimeout(() => {
+      const error = new Error(`Target processing timed out after ${timeoutMs}ms`);
+      error.name = "TargetProcessingTimeoutError";
+      error.details = {
+        page: target?.page || null,
+        url: target?.url || "",
+        tabId: target?.tabId || null,
+        timeoutMs
+      };
+
+      appendDebugLog("target-timeout", error.details);
+      if (Number.isInteger(target?.tabId)) {
+        chrome.tabs.remove(target.tabId).catch((removeError) => {
+          appendDebugLog("target-timeout-close-tab-failed", {
+            tabId: target.tabId,
+            error: toLoggableError(removeError)
+          });
+        });
+      }
+
+      reject(error);
+    }, timeoutMs);
+  });
+
+  return Promise.race([promise, timeoutPromise]).finally(() => {
+    clearTimeout(timeoutId);
+  });
+}
+
 function finishTask({ phase, message }) {
   currentTask = null;
   void clearActiveTask();
@@ -1248,6 +1560,102 @@ function finishTask({ phase, message }) {
     phase === "failed-partial" ? "预加载完成但存在警告" : "预加载完成",
     message
   );
+}
+
+async function stopCurrentTask(reason = "user-request") {
+  const stored = await chrome.storage.local.get(ACTIVE_TASK_STORAGE_KEY);
+  const persistedTask = stored[ACTIVE_TASK_STORAGE_KEY] || null;
+  const taskToStop = currentTask || persistedTask;
+
+  if (!taskToStop && currentStatus.phase !== "running") {
+    await clearActiveTask();
+    clearTaskAlarm();
+    return {
+      ok: true,
+      status: currentStatus,
+      message: "No running task to stop."
+    };
+  }
+
+  const stoppedTaskId = taskToStop?.id || currentTask?.id || null;
+  appendDebugLog("task-stop-request", {
+    taskId: stoppedTaskId,
+    reason
+  });
+
+  currentTask = null;
+  await clearActiveTask();
+  clearTaskAlarm();
+
+  const closeResult = await closeTaskTabs(taskToStop);
+  appendDebugLog("task-stopped", {
+    taskId: stoppedTaskId,
+    closedTabIds: closeResult.closedTabIds,
+    failedTabIds: closeResult.failedTabIds
+  });
+
+  setStatus({
+    phase: "stopped",
+    message: closeResult.closedTabIds.length
+      ? `Task stopped. Closed ${closeResult.closedTabIds.length} preload tab(s).`
+      : "Task stopped."
+  });
+
+  return {
+    ok: true,
+    status: currentStatus,
+    closedTabIds: closeResult.closedTabIds,
+    failedTabIds: closeResult.failedTabIds
+  };
+}
+
+async function closeTaskTabs(task) {
+  const tabIds = collectTaskTabIds(task);
+  if (!tabIds.length) {
+    return {
+      closedTabIds: [],
+      failedTabIds: []
+    };
+  }
+
+  const results = await Promise.all(
+    tabIds.map(async (tabId) => {
+      try {
+        await chrome.tabs.remove(tabId);
+        return { tabId, ok: true };
+      } catch (error) {
+        appendDebugLog("stop-close-tab-failed", {
+          tabId,
+          error: toLoggableError(error)
+        });
+        return { tabId, ok: false };
+      }
+    })
+  );
+
+  return {
+    closedTabIds: results.filter((result) => result.ok).map((result) => result.tabId),
+    failedTabIds: results.filter((result) => !result.ok).map((result) => result.tabId)
+  };
+}
+
+function collectTaskTabIds(task) {
+  const tabIds = new Set();
+  if (!task) {
+    return [];
+  }
+
+  if (Number.isInteger(task.activeTabId)) {
+    tabIds.add(task.activeTabId);
+  }
+
+  for (const target of task.targets || []) {
+    if (Number.isInteger(target?.tabId)) {
+      tabIds.add(target.tabId);
+    }
+  }
+
+  return [...tabIds];
 }
 
 function isCurrentTask(taskId) {
@@ -1340,7 +1748,7 @@ function appendDebugLog(type, payload) {
   debugLogs.push({
     at: new Date().toISOString(),
     type,
-    payload
+    payload: compactDebugPayload(payload)
   });
 
   if (debugLogs.length > MAX_DEBUG_LOGS) {
@@ -1350,6 +1758,32 @@ function appendDebugLog(type, payload) {
   void persistDebugLogs().catch((error) => {
     console.warn("保存诊断日志失败:", error);
   });
+}
+
+function getRecentDebugLogs(limit = 80) {
+  const normalizedLimit = Math.min(Math.max(Number(limit) || 80, 1), MAX_DEBUG_LOGS);
+  return debugLogs.slice(-normalizedLimit);
+}
+
+function compactDebugPayload(payload) {
+  try {
+    const serialized = JSON.stringify(payload);
+    if (!serialized || serialized.length <= MAX_DEBUG_LOG_PAYLOAD_CHARS) {
+      return payload;
+    }
+
+    return {
+      truncated: true,
+      originalLength: serialized.length,
+      preview: serialized.slice(0, MAX_DEBUG_LOG_PAYLOAD_CHARS)
+    };
+  } catch (error) {
+    return {
+      truncated: true,
+      error: toLoggableError(error),
+      preview: String(payload).slice(0, MAX_DEBUG_LOG_PAYLOAD_CHARS)
+    };
+  }
 }
 
 async function restorePersistedState() {
@@ -1433,6 +1867,27 @@ function isRestorableTask(task) {
     Number.isInteger(task.nextIndex) &&
     task.nextIndex >= 0 &&
     task.nextIndex <= task.targets.length
+  );
+}
+
+function isScriptExecutionTimeout(error) {
+  return error?.name === "ScriptExecutionTimeoutError";
+}
+
+function isTargetProcessingTimeout(error) {
+  return error?.name === "TargetProcessingTimeoutError";
+}
+
+function isMissingTabError(error) {
+  const message = error?.message || "";
+  return message.includes("No tab with id") || message.includes("No tab with given id");
+}
+
+function isExpectedTargetInterruption(error) {
+  return (
+    isMissingTabError(error) ||
+    isScriptExecutionTimeout(error) ||
+    isTargetProcessingTimeout(error)
   );
 }
 

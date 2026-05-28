@@ -1,13 +1,34 @@
 (function lazyPagePreloaderPanelBootstrap() {
+  const ROOT_ID = "lazy-page-preloader-root";
   const existing = window.__lazyPagePreloaderPanel;
-  if (existing?.destroy) {
-    existing.destroy();
+  const existingRoot = document.getElementById(ROOT_ID);
+  if (existingRoot && existing?.destroy) {
+    try {
+      existing.destroy();
+    } catch (error) {
+      existingRoot.remove();
+      window.__lazyPagePreloaderPanel = null;
+    }
     return;
   }
 
+  if (existingRoot) {
+    existingRoot.remove();
+  }
+
+  if (existing?.destroy) {
+    try {
+      existing.destroy();
+    } catch (error) {
+      void error;
+    }
+    window.__lazyPagePreloaderPanel = null;
+  }
+
   const PANEL_PORT_NAME = "lazy-page-preloader-panel";
-  const ROOT_ID = "lazy-page-preloader-root";
   const HEARTBEAT_MS = 20000;
+  const LOG_FETCH_LIMIT = 50;
+  const MAX_LOG_PAYLOAD_CHARS = 2000;
 
   const root = document.createElement("aside");
   root.id = ROOT_ID;
@@ -56,7 +77,10 @@
           <input data-role="concurrentTabs" type="number" min="1" max="5" inputmode="numeric" required />
         </label>
 
-        <button data-role="start" type="submit" class="lpp-primary-button">开始预加载</button>
+        <div class="lpp-form-actions">
+          <button data-role="start" type="submit" class="lpp-primary-button">开始预加载</button>
+          <button data-role="stop" type="button" class="lpp-stop-button" disabled>停止</button>
+        </div>
       </form>
 
       <section class="lpp-panel">
@@ -114,6 +138,7 @@
     waitSeconds: root.querySelector('[data-role="waitSeconds"]'),
     concurrentTabs: root.querySelector('[data-role="concurrentTabs"]'),
     start: root.querySelector('[data-role="start"]'),
+    stop: root.querySelector('[data-role="stop"]'),
     statusMessage: root.querySelector('[data-role="status-message"]'),
     phase: root.querySelector('[data-role="phase"]'),
     progress: root.querySelector('[data-role="progress"]'),
@@ -210,6 +235,26 @@
     renderStatus(createIdleStatus(response?.message || "刷新状态失败。"));
   };
 
+  const onStop = async () => {
+    elements.stop.disabled = true;
+    elements.stop.textContent = "停止中...";
+
+    try {
+      const response = await sendRuntimeMessage({ type: "STOP_PRELOAD" });
+      if (response?.ok && response.status) {
+        renderStatus(response.status);
+        await loadDebugLogs();
+        return;
+      }
+
+      renderStatus(createIdleStatus(response?.message || "停止失败，请重试。"));
+    } catch (error) {
+      renderStatus(createIdleStatus(error?.message || "停止失败，请检查扩展后台。"));
+    } finally {
+      elements.stop.textContent = "停止";
+    }
+  };
+
   const onRefreshLogs = async () => {
     try {
       await loadDebugLogs();
@@ -256,6 +301,7 @@
 
     chrome.runtime.onMessage.removeListener(onRuntimeMessage);
     elements.form.removeEventListener("submit", onSubmit);
+    elements.stop.removeEventListener("click", onStop);
     elements.refreshStatus.removeEventListener("click", onRefreshStatus);
     elements.refreshLogs.removeEventListener("click", onRefreshLogs);
     elements.exportLogs.removeEventListener("click", onExportLogs);
@@ -283,6 +329,7 @@
   window.__lazyPagePreloaderPanel = { destroy };
 
   elements.form.addEventListener("submit", onSubmit);
+  elements.stop.addEventListener("click", onStop);
   elements.refreshStatus.addEventListener("click", onRefreshStatus);
   elements.refreshLogs.addEventListener("click", onRefreshLogs);
   elements.exportLogs.addEventListener("click", onExportLogs);
@@ -325,9 +372,10 @@
         ? bootstrap.status || createIdleStatus()
         : createIdleStatus(bootstrap?.message || "初始化面板失败。")
     );
-    elements.debugLogs.value = formatDebugLogs(
-      bootstrap?.ok && Array.isArray(bootstrap.logs) ? bootstrap.logs : []
-    );
+    elements.debugLogs.value =
+      bootstrap?.ok && bootstrap.logCount
+        ? `Logs are not loaded. Click refresh to load the latest ${LOG_FETCH_LIMIT} of ${bootstrap.logCount}.`
+        : "Logs are not loaded. Click refresh when needed.";
     await onRefreshStatus();
   }
 
@@ -342,6 +390,7 @@
     elements.progress.textContent = `${safeStatus.currentIndex || 0} / ${safeStatus.total || 0}`;
     elements.successCount.textContent = String(safeStatus.successCount || 0);
     elements.failureCount.textContent = String(safeStatus.failureCount || 0);
+    elements.stop.disabled = safeStatus.phase !== "running";
   }
 
   function phaseText(phase) {
@@ -362,7 +411,10 @@
   }
 
   async function loadDebugLogs() {
-    const response = await sendRuntimeMessage({ type: "GET_DEBUG_LOGS" });
+    const response = await sendRuntimeMessage({
+      type: "GET_DEBUG_LOGS",
+      limit: LOG_FETCH_LIMIT
+    });
     const logs = response?.ok && Array.isArray(response.logs) ? response.logs : [];
     elements.debugLogs.value = formatDebugLogs(logs);
   }
@@ -387,10 +439,19 @@
 
     return logs
       .map((entry, index) => {
-        const payload = JSON.stringify(entry.payload, null, 2);
+        const payload = truncateText(JSON.stringify(entry.payload, null, 2));
         return `#${index + 1} ${entry.at} [${entry.type}]\n${payload}`;
       })
       .join("\n\n");
+  }
+
+  function truncateText(value) {
+    const text = String(value || "");
+    if (text.length <= MAX_LOG_PAYLOAD_CHARS) {
+      return text;
+    }
+
+    return `${text.slice(0, MAX_LOG_PAYLOAD_CHARS)}\n... truncated ${text.length - MAX_LOG_PAYLOAD_CHARS} chars ...`;
   }
 
   function clampNumber(value, min, max) {
