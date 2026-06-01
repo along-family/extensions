@@ -1,0 +1,25 @@
+{
+  "manifest_version": 3,
+  "name": "Farm Helper",
+  "version": "1.0.0",
+  "description": "Schedule farm crop status checks, harvests, and planting.",
+  "permissions": [
+    "alarms",
+    "cookies",
+    "notifications",
+    "scripting",
+    "tabs",
+    "storage"
+  ],
+  "host_permissions": [
+    "https://cdk.hybgzs.com/*"
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "action": {
+    "default_title": "Farm Helper",
+    "default_popup": "popup.html"
+  }
+}

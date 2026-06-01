@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Farm Helper</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <main class="app">
+      <header class="header">
+        <div>
+          <h1>农场助手</h1>
+          <p id="summary">等待启动</p>
+        </div>
+        <span id="run-badge" class="badge">停止</span>
+      </header>
+
+      <section class="section">
+        <div class="actions">
+          <button id="toggle-button" class="button primary" type="button">启动</button>
+          <button id="refresh-button" class="button" type="button">立即查询</button>
+        </div>
+      </section>
+
+      <section class="section">
+        <label class="field">
+          <span>种植数量</span>
+          <input id="quantity" type="number" min="1" max="999" inputmode="numeric" />
+        </label>
+        <label class="field">
+          <span>Cookie</span>
+          <textarea
+            id="cookieText"
+            rows="4"
+            spellcheck="false"
+            placeholder="name=value; name2=value2"
+          ></textarea>
+        </label>
+        <button id="save-button" class="button" type="button">保存配置</button>
+      </section>
+
+      <section class="section">
+        <dl class="status-grid">
+          <div>
+            <dt>作物数量</dt>
+            <dd id="crop-count">0</dd>
+          </div>
+          <div>
+            <dt>作物</dt>
+            <dd id="crop-name">-</dd>
+          </div>
+          <div>
+            <dt>成熟时间</dt>
+            <dd id="matures-at">-</dd>
+          </div>
+          <div>
+            <dt>下次收割</dt>
+            <dd id="next-harvest-at">-</dd>
+          </div>
+          <div>
+            <dt>下次刷新状态</dt>
+            <dd id="next-status-refresh-at">-</dd>
+          </div>
+          <div>
+            <dt>下次种植</dt>
+            <dd id="next-plant-at">-</dd>
+          </div>
+          <div>
+            <dt>最近动作</dt>
+            <dd id="last-action-at">-</dd>
+          </div>
+          <div>
+            <dt>最近查询</dt>
+            <dd id="last-status-at">-</dd>
+          </div>
+        </dl>
+      </section>
+
+      <p id="error-message" class="error" hidden></p>
+    </main>
+
+    <script type="module" src="popup.js"></script>
+  </body>
+</html>
