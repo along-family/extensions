@@ -1,0 +1,171 @@
+:root {
+  color-scheme: light;
+  font-family:
+    "Microsoft YaHei",
+    "PingFang SC",
+    Arial,
+    sans-serif;
+  color: #18201a;
+  background: #f6f7f2;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  width: 380px;
+  margin: 0;
+  background: #f6f7f2;
+}
+
+.app {
+  display: grid;
+  gap: 12px;
+  padding: 16px;
+}
+
+.header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+h1 {
+  margin: 0 0 4px;
+  font-size: 20px;
+  font-weight: 700;
+}
+
+p {
+  margin: 0;
+}
+
+#summary {
+  color: #526055;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.badge {
+  flex: 0 0 auto;
+  border: 1px solid #c8cec3;
+  border-radius: 999px;
+  padding: 4px 9px;
+  color: #596257;
+  background: #ffffff;
+  font-size: 12px;
+}
+
+.badge.active {
+  border-color: #2f8f5b;
+  color: #146b3c;
+  background: #e7f6ed;
+}
+
+.section {
+  display: grid;
+  gap: 10px;
+  border: 1px solid #d8ddd2;
+  border-radius: 8px;
+  padding: 12px;
+  background: #ffffff;
+}
+
+.actions {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+
+.button {
+  min-height: 34px;
+  border: 1px solid #bfc7ba;
+  border-radius: 6px;
+  padding: 7px 10px;
+  color: #1f2a22;
+  background: #ffffff;
+  font-size: 14px;
+  cursor: pointer;
+}
+
+.button:hover {
+  background: #f0f4ed;
+}
+
+.button:disabled {
+  cursor: wait;
+  opacity: 0.65;
+}
+
+.button.primary {
+  border-color: #27744b;
+  color: #ffffff;
+  background: #27744b;
+}
+
+.button.primary:hover {
+  background: #1f633f;
+}
+
+.field {
+  display: grid;
+  gap: 6px;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+input,
+textarea {
+  width: 100%;
+  border: 1px solid #c8cec3;
+  border-radius: 6px;
+  padding: 8px;
+  color: #18201a;
+  background: #ffffff;
+  font: inherit;
+  font-weight: 400;
+}
+
+textarea {
+  resize: vertical;
+}
+
+.status-grid {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 8px;
+  margin: 0;
+}
+
+.status-grid div {
+  display: grid;
+  grid-template-columns: 104px 1fr;
+  gap: 8px;
+  align-items: start;
+}
+
+dt {
+  color: #626b60;
+  font-size: 12px;
+}
+
+dd {
+  min-width: 0;
+  margin: 0;
+  color: #18201a;
+  font-size: 12px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.error {
+  border: 1px solid #e2b2a8;
+  border-radius: 8px;
+  padding: 10px;
+  color: #8f2415;
+  background: #fff0ed;
+  font-size: 13px;
+  line-height: 1.5;
+}
