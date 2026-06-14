@@ -20,6 +20,7 @@ const SCROLL_SCRIPT_RETURN_BUFFER_MS = 1200;
 const SCROLL_TO_TOP_DELAY_MS = 20000;
 const MIN_TARGET_TIMEOUT_MS = 45000;
 const TARGET_TIMEOUT_BUFFER_MS = 35000;
+const TAB_EDIT_RETRY_DELAYS_MS = [400, 900, 1500];
 const MAX_DEBUG_LOG_PAYLOAD_CHARS = 5000;
 const PANEL_PORT_NAME = "lazy-page-preloader-panel";
 const ACTIVE_TASK_STORAGE_KEY = "activePreloadTask";
@@ -372,7 +373,8 @@ async function runTarget(taskId, target, waitSeconds, index, total, batchSize) {
     await withTargetTimeout(
       processTarget(target, waitSeconds, index, total, batchSize),
       target,
-      waitSeconds
+      waitSeconds,
+      taskId
     );
     if (!isCurrentTask(taskId)) {
       return;
@@ -459,10 +461,16 @@ async function processTarget(target, waitSeconds, index, total, batchSize) {
     }
 
     if (!tabId) {
-      const createdTab = await chrome.tabs.create({
-        url: target.url,
-        active: false
-      });
+      const createdTab = await createTabWithRetry(
+        {
+          url: target.url,
+          active: false
+        },
+        {
+          page: target.page,
+          url: target.url
+        }
+      );
 
       tabId = createdTab.id || null;
       if (!tabId) {
@@ -470,7 +478,14 @@ async function processTarget(target, waitSeconds, index, total, batchSize) {
       }
 
       target.tabId = tabId;
-      await chrome.tabs.update(tabId, { autoDiscardable: false }).catch(() => {});
+      await updateTabWithRetry(
+        tabId,
+        { autoDiscardable: false },
+        {
+          page: target.page,
+          url: target.url
+        }
+      ).catch(() => {});
 
       appendDebugLog("tab-created", {
         tabId,
@@ -847,7 +862,7 @@ async function togglePanelForTab(tab) {
 
   try {
     if (targetTab.id !== tab?.id) {
-      await chrome.tabs.update(targetTab.id, { active: true }).catch(() => {});
+      await updateTabWithRetry(targetTab.id, { active: true }).catch(() => {});
     }
 
     await chrome.scripting.insertCSS({
@@ -1514,7 +1529,7 @@ function getTargetTimeoutMs(waitSeconds) {
   );
 }
 
-function withTargetTimeout(promise, target, waitSeconds) {
+function withTargetTimeout(promise, target, waitSeconds, taskId) {
   const timeoutMs = getTargetTimeoutMs(waitSeconds);
   let timeoutId = null;
 
@@ -1530,8 +1545,11 @@ function withTargetTimeout(promise, target, waitSeconds) {
       };
 
       appendDebugLog("target-timeout", error.details);
-      if (Number.isInteger(target?.tabId)) {
-        chrome.tabs.remove(target.tabId).catch((removeError) => {
+      if (isCurrentTask(taskId) && Number.isInteger(target?.tabId)) {
+        void removeTabWithRetry(target.tabId, {
+          page: target?.page || null,
+          url: target?.url || ""
+        }).catch((removeError) => {
           appendDebugLog("target-timeout-close-tab-failed", {
             tabId: target.tabId,
             error: toLoggableError(removeError)
@@ -1587,55 +1605,23 @@ async function stopCurrentTask(reason = "user-request") {
   await clearActiveTask();
   clearTaskAlarm();
 
-  const closeResult = await closeTaskTabs(taskToStop);
+  const preservedTabIds = collectTaskTabIds(taskToStop);
   appendDebugLog("task-stopped", {
     taskId: stoppedTaskId,
-    closedTabIds: closeResult.closedTabIds,
-    failedTabIds: closeResult.failedTabIds
+    preservedTabIds
   });
 
   setStatus({
     phase: "stopped",
-    message: closeResult.closedTabIds.length
-      ? `Task stopped. Closed ${closeResult.closedTabIds.length} preload tab(s).`
+    message: preservedTabIds.length
+      ? `Task stopped. Kept ${preservedTabIds.length} preload tab(s) open.`
       : "Task stopped."
   });
 
   return {
     ok: true,
     status: currentStatus,
-    closedTabIds: closeResult.closedTabIds,
-    failedTabIds: closeResult.failedTabIds
-  };
-}
-
-async function closeTaskTabs(task) {
-  const tabIds = collectTaskTabIds(task);
-  if (!tabIds.length) {
-    return {
-      closedTabIds: [],
-      failedTabIds: []
-    };
-  }
-
-  const results = await Promise.all(
-    tabIds.map(async (tabId) => {
-      try {
-        await chrome.tabs.remove(tabId);
-        return { tabId, ok: true };
-      } catch (error) {
-        appendDebugLog("stop-close-tab-failed", {
-          tabId,
-          error: toLoggableError(error)
-        });
-        return { tabId, ok: false };
-      }
-    })
-  );
-
-  return {
-    closedTabIds: results.filter((result) => result.ok).map((result) => result.tabId),
-    failedTabIds: results.filter((result) => !result.ok).map((result) => result.tabId)
+    preservedTabIds
   };
 }
 
@@ -1878,6 +1864,14 @@ function isTargetProcessingTimeout(error) {
   return error?.name === "TargetProcessingTimeoutError";
 }
 
+function isRetryableTabEditError(error) {
+  const message = (error?.message || "").toLowerCase();
+  return (
+    message.includes("tabs cannot be edited right now") ||
+    message.includes("user may be dragging a tab")
+  );
+}
+
 function isMissingTabError(error) {
   const message = error?.message || "";
   return message.includes("No tab with id") || message.includes("No tab with given id");
@@ -1886,9 +1880,84 @@ function isMissingTabError(error) {
 function isExpectedTargetInterruption(error) {
   return (
     isMissingTabError(error) ||
+    isRetryableTabEditError(error) ||
     isScriptExecutionTimeout(error) ||
     isTargetProcessingTimeout(error)
   );
+}
+
+async function createTabWithRetry(createProperties, context = {}) {
+  return withTabEditRetry(
+    () => chrome.tabs.create(createProperties),
+    {
+      ...context,
+      operation: "create"
+    }
+  );
+}
+
+async function updateTabWithRetry(tabId, updateProperties, context = {}) {
+  return withTabEditRetry(
+    () => chrome.tabs.update(tabId, updateProperties),
+    {
+      ...context,
+      operation: "update",
+      tabId
+    }
+  );
+}
+
+async function removeTabWithRetry(tabId, context = {}) {
+  return withTabEditRetry(
+    () => chrome.tabs.remove(tabId),
+    {
+      ...context,
+      operation: "remove",
+      tabId
+    }
+  );
+}
+
+async function withTabEditRetry(action, context = {}) {
+  let attempt = 0;
+  let lastError = null;
+
+  while (attempt <= TAB_EDIT_RETRY_DELAYS_MS.length) {
+    try {
+      return await action();
+    } catch (error) {
+      lastError = error;
+
+      if (context.operation === "remove" && isMissingTabError(error)) {
+        return null;
+      }
+
+      if (!isRetryableTabEditError(error) || attempt >= TAB_EDIT_RETRY_DELAYS_MS.length) {
+        throw error;
+      }
+
+      const delayMs = TAB_EDIT_RETRY_DELAYS_MS[attempt];
+      appendDebugLog("tab-edit-retry", {
+        operation: context.operation || "unknown",
+        tabId: context.tabId || null,
+        page: context.page || null,
+        url: context.url || "",
+        attempt: attempt + 1,
+        delayMs,
+        error: toLoggableError(error)
+      });
+      await delay(delayMs);
+      attempt += 1;
+    }
+  }
+
+  throw lastError;
+}
+
+function delay(ms) {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
 }
 
 function toLoggableError(error) {

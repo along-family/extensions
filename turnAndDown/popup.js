@@ -24,6 +24,16 @@ const refreshLogsButton = document.querySelector("#refresh-logs-button");
 const clearLogsButton = document.querySelector("#clear-logs-button");
 const debugLogsField = document.querySelector("#debug-logs");
 
+function isExtensionContextInvalidated(error) {
+  return /Extension context invalidated/i.test(error?.message || "");
+}
+
+function getRuntimeErrorMessage(error, fallbackMessage) {
+  return isExtensionContextInvalidated(error)
+    ? "扩展刚刚被重载或更新，当前弹窗已经失效。请关闭后重新打开扩展弹窗。"
+    : error?.message || fallbackMessage;
+}
+
 init().catch((error) => {
   console.error("Popup initialization failed:", error);
   renderStatus({
@@ -76,7 +86,7 @@ form.addEventListener("submit", async (event) => {
     console.error("Failed to start task:", error);
     renderStatus({
       ...createIdleStatus(),
-      message: "启动失败，请检查扩展权限。"
+      message: getRuntimeErrorMessage(error, "启动失败，请检查扩展权限。")
     });
   } finally {
     setBusy(false);
@@ -87,7 +97,7 @@ refreshLogsButton?.addEventListener("click", () => {
   loadDebugLogs().catch((error) => {
     console.error("Failed to refresh debug logs:", error);
     if (debugLogsField) {
-      debugLogsField.value = `刷新日志失败: ${error.message || error}`;
+      debugLogsField.value = `刷新日志失败: ${getRuntimeErrorMessage(error, String(error))}`;
     }
   });
 });
@@ -123,7 +133,7 @@ stopButton?.addEventListener("click", async () => {
     console.error("Failed to stop task:", error);
     renderStatus({
       ...createIdleStatus(),
-      message: "停止失败，请检查扩展后台。"
+      message: getRuntimeErrorMessage(error, "停止失败，请检查扩展后台。")
     });
   } finally {
     stopButton.textContent = "停止";
@@ -167,6 +177,12 @@ async function init() {
     }
   } catch (error) {
     console.warn("Failed to fetch live status:", error);
+    if (isExtensionContextInvalidated(error)) {
+      renderStatus({
+        ...createIdleStatus(),
+        message: getRuntimeErrorMessage(error, "无法读取实时状态。")
+      });
+    }
   }
 }
 
@@ -216,6 +232,10 @@ async function loadDebugLogs() {
     }
   } catch (error) {
     console.warn("Failed to fetch live debug logs:", error);
+    if (isExtensionContextInvalidated(error)) {
+      debugLogsField.value = getRuntimeErrorMessage(error, "无法读取实时日志。");
+      return;
+    }
   }
 
   const stored = await chrome.storage.session.get(DEBUG_LOGS_STORAGE_KEY);

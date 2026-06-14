@@ -9,7 +9,6 @@
       existingRoot.remove();
       window.__lazyPagePreloaderPanel = null;
     }
-    return;
   }
 
   if (existingRoot) {
@@ -157,13 +156,49 @@
   let logRefreshTimer = null;
   let port = null;
 
+  const isExtensionContextInvalidated = (error) =>
+    /Extension context invalidated/i.test(error?.message || "");
+
+  const getRuntimeErrorMessage = (error, fallbackMessage) =>
+    isExtensionContextInvalidated(error)
+      ? "扩展刚刚被重载或更新，当前面板已经失效。请重新点击扩展图标打开面板。"
+      : error?.message || fallbackMessage;
+
+  const markContextInvalidated = () => {
+    if (heartbeatId) {
+      clearInterval(heartbeatId);
+      heartbeatId = null;
+    }
+
+    try {
+      port?.onMessage?.removeListener(onPortMessage);
+      port?.disconnect();
+    } catch (error) {
+      void error;
+    }
+    port = null;
+
+    setBusy(false);
+    renderStatus(
+      createIdleStatus(
+        "扩展刚刚被重载或更新，当前面板已经失效。请重新点击扩展图标打开面板。"
+      )
+    );
+
+    elements.debugLogs.value =
+      "当前面板属于旧的扩展上下文，已无法继续读取日志。请重新打开面板后再刷新日志。";
+  };
+
   const sendRuntimeMessage = async (message) => {
     try {
       return await chrome.runtime.sendMessage(message);
     } catch (error) {
+      if (isExtensionContextInvalidated(error)) {
+        markContextInvalidated();
+      }
       return {
         ok: false,
-        message: error?.message || "无法连接扩展后台。"
+        message: getRuntimeErrorMessage(error, "无法连接扩展后台。")
       };
     }
   };
@@ -259,7 +294,7 @@
     try {
       await loadDebugLogs();
     } catch (error) {
-      elements.debugLogs.value = error?.message || String(error);
+      elements.debugLogs.value = getRuntimeErrorMessage(error, String(error));
     }
   };
 
@@ -268,7 +303,7 @@
       await sendRuntimeMessage({ type: "CLEAR_DEBUG_LOGS" });
       elements.debugLogs.value = "";
     } catch (error) {
-      elements.debugLogs.value = error?.message || String(error);
+      elements.debugLogs.value = getRuntimeErrorMessage(error, String(error));
     }
   };
 
@@ -287,7 +322,7 @@
       link.remove();
       URL.revokeObjectURL(url);
     } catch (error) {
-      elements.debugLogs.value = error?.message || String(error);
+      elements.debugLogs.value = getRuntimeErrorMessage(error, String(error));
     }
   };
 
@@ -344,11 +379,15 @@
       try {
         port.postMessage({ type: "PING", at: Date.now() });
       } catch (error) {
-        void error;
+        if (isExtensionContextInvalidated(error)) {
+          markContextInvalidated();
+        }
       }
     }, HEARTBEAT_MS);
   } catch (error) {
-    void error;
+    if (isExtensionContextInvalidated(error)) {
+      markContextInvalidated();
+    }
   }
 
   void init();
@@ -427,7 +466,7 @@
     logRefreshTimer = window.setTimeout(() => {
       logRefreshTimer = null;
       loadDebugLogs().catch((error) => {
-        elements.debugLogs.value = error?.message || String(error);
+        elements.debugLogs.value = getRuntimeErrorMessage(error, String(error));
       });
     }, 1200);
   }
